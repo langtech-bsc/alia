@@ -9,7 +9,7 @@ run:
   dependency: singleton
 
 trainer:
-  num_nodes: 256
+  num_nodes: 64
   devices: 4
   accelerator: gpu
   precision: bf16
