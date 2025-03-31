@@ -1,0 +1,843 @@
+hydra:
+  searchpath:
+  - file:///opt/NeMo/examples/nlp/language_modeling/conf
+
+run:
+  name: 40b_annealing_mix_2024_upsampling_fineweb2_data_annealing_papers_no_privative_licenses
+  results_dir: /results
+  time_limit: "300:00:00:00" # use quotation marks if +10 days
+  dependency: singleton
+
+trainer:
+  num_nodes: 64
+  devices: 4
+  accelerator: gpu
+  precision: bf16
+  logger: false # logger provided by exp_manager
+  enable_checkpointing: false
+  use_distributed_sampler: false
+  max_time: "299:00:00:00" # should be lower than run.time_limit
+  log_every_n_steps: 5
+  limit_val_batches: 32
+  limit_test_batches: 32
+  gradient_clip_val: 1.0
+  val_check_interval: 1000
+  max_epochs: null
+  max_steps: 141117 # train tokens annealing_mix_2024_upsampling_fineweb2_data_annealing_papers_no_privative_licenses: (591888898062/8192/512) =  141117
+  accumulate_grad_batches: 1 # do not modify, grad acc is automatic for training megatron models
+
+exp_manager: # /opt/NeMo/nemo/utils/exp_manager.py
+  seconds_to_sleep: 180
+  name: ${run.name} # The name of the experiment
+  exp_dir: null # The base directory to create the logging directory. Defaults to None, which logs to ./nemo_experiments.
+  explicit_log_dir: ${run.results_dir} # Can be used to override exp_dir/name/version folder creation.
+  log_global_rank_0_only: true # Reduces amount of log files in exp_dir. Cannot be used with log_local_rank_0_only
+  log_local_rank_0_only: false # Reduces amount of log files in exp_dir. Cannot be used with log_global_rank_0_only
+  create_tensorboard_logger: true
+  # summary_writer_kwargs: null
+  create_wandb_logger: true
+  wandb_logger_kwargs:
+    project: ${run.name}
+    name: 40b_${model.encoder_seq_length}_${trainer.num_nodes}nodes
+  create_neptune_logger: false
+  neptune_logger_kwargs:
+    project: null
+    name: null
+    prefix: train
+    log_model_checkpoints: false
+    tags: null
+    description: null
+  resume_if_exists: true # whether this experiment is resuming from a previous run
+  resume_past_end: false # exp_manager errors out if resume_if_exists is True and there's a *end.ckpt checkpoint
+  resume_ignore_no_checkpoint: true # exp_manager errors out if resume_if_exists is True and no checkpoint could be found
+  create_checkpoint_callback: true # whether to create a ModelCheckpoint callback and attach it to the pytorch lightning trainer
+  checkpoint_callback_params:
+    monitor: val_loss
+    save_top_k: 5
+    mode: min
+    always_save_nemo: false # saves nemo file during validation, not implemented for model parallel
+    save_nemo_on_train_end: true # save compressed nemo file when training is completed
+    filename: megatron_gpt40b--{val_loss:.2f}-{step}-{consumed_samples}
+    model_parallel_size: ${multiply:${model.tensor_model_parallel_size}, ${model.pipeline_model_parallel_size}}
+    every_n_epochs: null
+    every_n_train_steps: ${trainer.val_check_interval}
+  log_step_timing: true
+  step_timing_kwargs:
+    sync_cuda: true
+    buffer_size: 5
+
+model:
+
+  dist_ckpt_load_strictness: log_all
+
+  ## PARALLELISM
+  micro_batch_size: 1 # limited by VRAM
+  global_batch_size: 1024 # will use more micro batches to reach global batch size
+  rampup_batch_size: null # [<start_batch_size>, <batch_size_increment>, <rampup_samples>]
+  context_parallel_size: 1
+  tensor_model_parallel_size: 4 # intra-layer model parallelism
+  pipeline_model_parallel_size: 2 # inter-layer model parallelism
+  virtual_pipeline_model_parallel_size: null # interleaved pipeline
+  sequence_parallel: true # Makes TP more memory efficient for LLMs (20B+) by parallelizing layer norms and dropout sequentially
+  # gc_interval: 1
+
+  ## ARCHITECTURE
+  use_flash_attention: true # this config does nothing when transformer_engine=True
+  encoder_seq_length: 4096
+  max_position_embeddings: 4096
+  num_layers: 48
+  hidden_size: 8192
+  ffn_hidden_size: 24576
+  num_attention_heads: 64
+  init_method_std: 0.007 # default: 0.01
+  use_scaled_init_method: true
+  hidden_dropout: 0.0
+  attention_dropout: 0.0
+  ffn_dropout: 0.0
+  kv_channels: null
+  apply_query_key_layer_scaling: true
+  normalization: rmsnorm # layernorm1p
+  layernorm_zero_centered_gamma: false
+  layernorm_epsilon: 1.0e-05
+  do_layer_norm_weight_decay: false
+  make_vocab_size_divisible_by: 128
+  pre_process: true # add embedding
+  post_process: true # add pooler
+  persist_layer_norm: true
+  bias: false
+  activation: fast-swiglu # squared-relu
+  headscale: false
+  transformer_block_type: pre_ln
+  openai_gelu: false
+  normalize_attention_scores: true
+  position_embedding_type: rope # Sergio: bug when using rope with mbs1
+  rotary_percentage: 1.0 # llama:1.0, pythia:0.25
+  rotary_base: 10000
+  attention_type: multihead
+  num_query_groups: 8 # null
+  share_embeddings_and_output_weights: false
+  overlap_p2p_comm: false
+  batch_p2p_comm: true
+
+  ## MEGATRON O2-STYLE HALF-PRECISION
+  megatron_amp_O2: true # Enable O2-level automatic mixed precision using main parameters
+  grad_allreduce_chunk_size_mb: 125
+
+  # MISCELLANEOUS
+  seed: 1234
+  resume_from_checkpoint: null # Manually set the checkpoint file to load from
+  use_cpu_initialization: false # Init weights on the CPU (slow for large models)
+  onnx_safe: false # Use work-arounds for known problems with Torch ONNX exporter
+  apex_transformer_log_level: 30 # Python logging level displays logs with severity greater than or equal to this
+  gradient_as_bucket_view: true # PyTorch DDP argument. Allocate gradients in a contiguous bucket to save memory (less fragmentation and buffer memory)
+  sync_batch_comm: false # Enable stream synchronization after each p2p communication between pipeline stages
+  nccl_communicator_config_path: null # Path to the yaml file with NCCL communicator options (min_ctas, max_ctas, and cga_cluster_size)
+  
+  ## ACTIVATION CHECKPOINTING
+  activations_checkpoint_granularity: selective
+  activations_checkpoint_method: uniform
+  activations_checkpoint_num_layers: null
+  num_micro_batches_with_partial_activation_checkpoints: null
+  activations_checkpoint_layers_per_pipeline: null
+
+  ## MEGATRON CORE
+  mcore_gpt: true # use GPTModel from megatron.core
+
+  ## NETWORK
+  sharp: false # Enable the use of SHARP (if supported) for NCCL data-parallel communications.
+
+  ## MIXED PRECISION
+  native_amp_init_scale: 4294967296 # 2**32
+  native_amp_growth_interval: 1000
+  hysteresis: 2 # Gradient scale hysteresis
+  fp32_residual_connection: false # Move residual connections to fp32
+  fp16_lm_cross_entropy: false # Move the cross entropy unreduced loss calculation for lm head to fp16
+
+  ## FUSION
+  grad_div_ar_fusion: true # Fuse grad division into torch.distributed.all_reduce. Only used with O2 and no PP.
+  gradient_accumulation_fusion: false # Fuse weight gradient accumulation to GEMMs. Only used with O2 and PP.
+  bias_activation_fusion: false # Use a kernel that fuses the bias addition from weight matrices with the subsequent activation function.
+  bias_dropout_add_fusion: false # Use a kernel that fuses the bias addition, dropout and residual connection addition.
+  masked_softmax_fusion: true # Use a kernel that fuses the attention softmax with it's mask.
+  apply_rope_fusion: true # Use a kernel to add rotary positional embeddings.
+  # get_attention_mask_from_fusion: true # When using fused softmax it will create the attention mask so we won't copy it to the pipeline stages.
+
+  ## TRANSFORMER ENGINE (FP8 TRAINING)
+  transformer_engine: true # set to true for FP8 training
+  fp8: false # set to true for FP8 training
+  # fp8_wgrad: true # ACCELERATION CHANGE
+  fp8_e4m3: false # sets fp8_format = recipe.Format.E4M3
+  fp8_hybrid: true # sets fp8_format = recipe.Format.HYBRID
+  fp8_margin: 0 # scaling margin
+  fp8_interval: 1 # scaling update interval
+  fp8_amax_history_len: 1024 # Number of steps for which amax history is recorded per tensor
+  fp8_amax_compute_algo: max # 'most_recent' or 'max'. Algorithm for computing amax from history
+  reduce_amax: true # Perform reduction to sync amax tensors across GPUs after every iteration
+  use_emha: false # Use fused multi-head attention for large sequence-length. Set to False because it is not supported yet.
+  ub_tp_comm_overlap: false # Use userbuffer backend to overlap TP communications with computes. This feature is only available with TE and squence parallelism enabled.
+  ub_tp_comm_overlap_cfg: null # A yaml file with userbuffer communicator configurations. If the configuration file is not provided a default setting is used for all communicators.
+
+  ## TOKENIZER
+  tokenizer:
+    library: sentencepiece
+    type: /tokenizer
+    model: /tokenizer/6f25fea293d447bea4019a3a68512de0_alpha_0.model
+    vocab_file: /tokenizer/1eab2a242aeb4e6b82e361f6cc9a77ca_alpha_0.vocab
+    merge_file: null
+    delimiter: null # only used for tabular tokenizer
+    sentencepiece_legacy: false # Legacy=True allows you to add special tokens to sentencepiece tokenizers.
+
+  ## OPTIMIZER
+  optim:
+    name: distributed_fused_adam
+    lr: 9.0e-06
+    weight_decay: 0.1
+    betas: [0.9,0.95]
+    sched:
+      name: CosineAnnealing
+      warmup_steps: 1000
+      constant_steps: 0
+      min_lr: 9.0e-07
+    grad_sync_dtype: bf16 # ACCELERATION CHANGE
+    overlap_grad_sync: true # ACCELERATION CHANGE
+    overlap_param_sync: true # ACCELERATION CHANGE
+    contiguous_grad_buffer: true # ACCELERATION CHANGE
+    contiguous_param_buffer: true # ACCELERATION CHANGE
+    bucket_cap_mb: 220 # ACCELERATION CHANGE
+
+  ## TRAINING DATA
+  data:
+    data_impl: mmap
+    num_workers: 0
+    skip_warmup: true
+    eod_mask_loss: false
+    dataloader_type: single
+    reset_position_ids: false
+    reset_attention_mask: false
+    splits_string: "98,1,1" # "99990,8,2"
+    seq_length: ${model.encoder_seq_length}
+    exchange_indices_distributed: true # Set to True to exchange indices via torch.distributed instead of filesystem 
+    shuffle_documents: true # Set to False to disable documents shuffling. Sample index will still be shuffled
+    index_mapping_dir: null # path to save index mapping .npy files, by default will save in the same location as data_prefix
+    data_prefix:
+      test:
+      - 0.008332568038961576
+      - /data/test/fineweb2_ar_shard_0_validation_text_document
+      - 0.00746626265115056
+      - /data/test/fineweb2_nl_shard_0_validation_text_document
+      - 0.007450531333818254
+      - /data/test/fineweb2_nn_shard_0_validation_text_document
+      - 0.007849239863817057
+      - /data/test/fineweb2_lt_shard_0_validation_text_document
+      - 0.008146242852835078
+      - /data/test/fineweb2_sk_shard_0_validation_text_document
+      - 0.009000783070908425
+      - /data/test/fineweb2_as_shard_0_validation_text_document
+      - 0.11873196499342967
+      - /data/test/starcoder_mini_shard_0_part_04_validation_text_document
+      - 0.007479777120653621
+      - /data/test/fineweb2_sv_shard_0_validation_text_document
+      - 0.007382805321752373
+      - /data/test/fineweb2_lv_shard_0_validation_text_document
+      - 0.007042075664743688
+      - /data/test/fineweb2_gl_shard_0_validation_text_document
+      - 0.007308264177627988
+      - /data/test/fineweb2_eu_shard_0_validation_text_document
+      - 0.11631146502551024
+      - /data/test/automathtext_mini_shard_0_part_04_validation_text_document
+      - 0.005596010677751986
+      - /data/test/fineweb2_sr_shard_0_validation_text_document
+      - 0.008070798656375522
+      - /data/test/fineweb2_et_shard_0_validation_text_document
+      - 0.05644421201463343
+      - /data/test/validation_data_annealing_papers
+      - 0.007447859318481361
+      - /data/test/fineweb2_pl_shard_0_validation_text_document
+      - 0.004706732075494991
+      - /data/test/fineweb2_uk_shard_0_validation_text_document
+      - 0.007855034692390418
+      - /data/test/fineweb2_ga_shard_0_validation_text_document
+      - 0.0076943663883349885
+      - /data/test/fineweb2_cs_shard_0_validation_text_document
+      - 0.007119102387593833
+      - /data/test/fineweb2_hr_shard_0_validation_text_document
+      - 0.06689131350980182
+      - /data/test/aya_mini_shard_0_part_09_validation_text_document
+      - 0.008171269054807551
+      - /data/test/fineweb2_ro_shard_0_validation_text_document
+      - 0.10232788095410052
+      - /data/test/openwebmath_mini_shard_0_part_04_validation_text_document
+      - 0.007572224190394847
+      - /data/test/fineweb2_de_shard_0_validation_text_document
+      - 0.00842699818250012
+      - /data/test/fineweb2_cy_shard_0_validation_text_document
+      - 0.008038695145860144
+      - /data/test/fineweb2_no_shard_0_validation_text_document
+      - 0.08435671563218644
+      - /data/test/finewebedu_mini_shard_9_part_04_validation_text_document
+      - 0.00512895346653684
+      - /data/test/fineweb2_bg_shard_0_validation_text_document
+      - 0.007830655192412812
+      - /data/test/fineweb2_fr_shard_0_validation_text_document
+      - 0.007516615101516544
+      - /data/test/fineweb2_it_shard_0_validation_text_document
+      - 0.004784744873233705
+      - /data/test/fineweb2_ru_shard_0_validation_text_document
+      - 0.0073533774679139475
+      - /data/test/fineweb2_es_shard_0_validation_text_document
+      - 0.008031406639593687
+      - /data/test/fineweb2_oc_shard_0_validation_text_document
+      - 0.007500118374503379
+      - /data/test/fineweb2_ca_shard_0_validation_text_document
+      - 0.008542477456396316
+      - /data/test/fineweb2_mt_shard_0_validation_text_document
+      - 0.005006458786878776
+      - /data/test/fineweb2_el_shard_0_validation_text_document
+      - 0.007903962650524468
+      - /data/test/fineweb2_sl_shard_0_validation_text_document
+      - 0.007235936239992788
+      - /data/test/fineweb2_pt_shard_0_validation_text_document
+      - 0.13192797236222312
+      - /data/test/mathpile_mini_shard_0_part_02_validation_text_document
+      - 0.007783156824386779
+      - /data/test/fineweb2_fi_shard_0_validation_text_document
+      - 0.007883467003856115
+      - /data/test/fineweb2_da_shard_0_validation_text_document
+      - 0.00837685547332166
+      - /data/test/fineweb2_hu_shard_0_validation_text_document
+      - 0.0639726490907926
+      - /data/test/wikipedia_mini_wikipedia_shuffled_part_11_validation_text_document
+      train:
+      - 0.004216488947793337
+      - /data/train/finewebedu_mini_shard_11_part_03_text_document
+      - 0.004216862524660084
+      - /data/train/finewebedu_mini_shard_2_part_03_text_document
+      - 0.003549764038283946
+      - /data/train/fineweb2_es_shard_105_text_document
+      - 0.0030250463285635865
+      - /data/train/finewebedu_mini_shard_5_part_04_text_document
+      - 0.004217220588480327
+      - /data/train/finewebedu_mini_shard_4_part_03_text_document
+      - 0.004217967652669988
+      - /data/train/finewebedu_mini_shard_7_part_03_text_document
+      - 0.02656120826978783
+      - /data/train/train_mix_dades_annealing_papers_no_privative_licenses_shard_3_text_document
+      - 7.041039143740546e-05
+      - /data/train/fineweb2_oc_shard_0_text_document
+      - 0.0053898515793175585
+      - /data/train/mathpile_mini_shard_0_part_02_text_document
+      - 0.00258254626502537
+      - /data/train/fineweb2_gl_shard_0_text_document_copy4
+      - 0.00421697085411213
+      - /data/train/finewebedu_mini_shard_3_part_00_text_document
+      - 0.004215899034718191
+      - /data/train/finewebedu_mini_shard_15_part_03_text_document
+      - 0.004216010988161172
+      - /data/train/finewebedu_mini_shard_11_part_01_text_document
+      - 0.004218244059273551
+      - /data/train/finewebedu_mini_shard_5_part_00_text_document
+      - 0.004215544919274084
+      - /data/train/finewebedu_mini_shard_4_part_01_text_document
+      - 0.0035547718125633846
+      - /data/train/fineweb2_es_shard_108_text_document
+      - 0.004218017373149788
+      - /data/train/finewebedu_mini_shard_1_part_00_text_document
+      - 0.0028530581525168432
+      - /data/train/fineweb2_eu_shard_1_text_document_copy1
+      - 0.004217075708249796
+      - /data/train/finewebedu_mini_shard_7_part_01_text_document
+      - 9.080784785115181e-05
+      - /data/train/fineweb2_as_shard_0_text_document
+      - 0.004217055817692567
+      - /data/train/finewebedu_mini_shard_0_part_00_text_document
+      - 0.0059005773489506546
+      - /data/train/starcoder_mini_shard_0_part_00_text_document
+      - 0.0031930745536673834
+      - /data/train/wikipedia_mini_wikipedia_shuffled_part_10_text_document
+      - 0.0035604810698430267
+      - /data/train/fineweb2_es_shard_124_text_document
+      - 0.0029996425761883816
+      - /data/train/finewebedu_mini_shard_4_part_04_text_document
+      - 0.0033623459614063153
+      - /data/train/fineweb2_hr_shard_7_text_document
+      - 0.00421696695304217
+      - /data/train/finewebedu_mini_shard_5_part_02_text_document
+      - 0.003016079870470899
+      - /data/train/finewebedu_mini_shard_1_part_04_text_document
+      - 0.003550801403576673
+      - /data/train/fineweb2_es_shard_109_text_document
+      - 0.00258254626502537
+      - /data/train/fineweb2_gl_shard_0_text_document
+      - 0.003706011165578962
+      - /data/train/fineweb2_de_shard_17_text_document
+      - 0.004878084153045828
+      - /data/train/openwebmath_mini_shard_0_part_03_text_document
+      - 0.002824426439613479
+      - /data/train/fineweb2_eu_shard_0_text_document_copy1
+      - 0.0023327726969046276
+      - /data/train/fineweb2_bg_shard_6_text_document
+      - 0.003242993405155801
+      - /data/train/fineweb2_ca_shard_1_text_document_copy1
+      - 0.0037839699026850034
+      - /data/train/fineweb2_da_shard_2_text_document
+      - 0.004216567597688871
+      - /data/train/finewebedu_mini_shard_12_part_02_text_document
+      - 0.003243810463900412
+      - /data/train/fineweb2_ca_shard_4_text_document
+      - 0.0030417984420640517
+      - /data/train/finewebedu_mini_shard_3_part_04_text_document
+      - 0.005231675267333087
+      - /data/train/starcoder_mini_shard_0_part_04_text_document
+      - 0.005683131324162201
+      - /data/train/mathpile_mini_shard_0_part_01_text_document
+      - 0.0034863533371829623
+      - /data/train/fineweb2_lv_shard_2_text_document
+      - 0.004216910121430511
+      - /data/train/finewebedu_mini_shard_11_part_00_text_document
+      - 0.004217579627145684
+      - /data/train/finewebedu_mini_shard_8_part_00_text_document
+      - 0.003198194918333663
+      - /data/train/wikipedia_mini_wikipedia_shuffled_part_06_text_document
+      - 0.003320599478103613
+      - /data/train/aya_mini_shard_0_part_04_text_document
+      - 0.003242993405155801
+      - /data/train/fineweb2_ca_shard_1_text_document
+      - 0.0033185724338324193
+      - /data/train/aya_mini_shard_0_part_06_text_document
+      - 0.004216975430984596
+      - /data/train/finewebedu_mini_shard_9_part_01_text_document
+      - 0.0031912532980169907
+      - /data/train/wikipedia_mini_wikipedia_shuffled_part_04_text_document
+      - 0.013520887702410842
+      - /data/train/automathtext_mini_shard_0_part_01_text_document
+      - 0.004217704089693033
+      - /data/train/finewebedu_mini_shard_11_part_02_text_document
+      - 0.003320690125183117
+      - /data/train/aya_mini_shard_0_part_08_text_document
+      - 0.004216772342194802
+      - /data/train/finewebedu_mini_shard_6_part_03_text_document
+      - 0.004218229521072162
+      - /data/train/finewebedu_mini_shard_10_part_03_text_document
+      - 0.0033221645387138616
+      - /data/train/aya_mini_shard_0_part_00_text_document
+      - 0.003236462512259082
+      - /data/train/fineweb2_ca_shard_2_text_document
+      - 0.0028530581525168432
+      - /data/train/fineweb2_eu_shard_1_text_document_copy3
+      - 0.003561041136100538
+      - /data/train/fineweb2_es_shard_115_text_document
+      - 0.00322671020567097
+      - /data/train/fineweb2_ca_shard_0_text_document_copy1
+      - 0.003553797249597448
+      - /data/train/fineweb2_es_shard_132_text_document
+      - 0.0023655757365689503
+      - /data/train/fineweb2_el_shard_18_text_document
+      - 0.002315233287001872
+      - /data/train/aya_mini_shard_0_part_09_text_document
+      - 0.0042178314159534965
+      - /data/train/finewebedu_mini_shard_3_part_02_text_document
+      - 0.003236462512259082
+      - /data/train/fineweb2_ca_shard_2_text_document_copy1
+      - 0.0030262491286200347
+      - /data/train/finewebedu_mini_shard_0_part_04_text_document
+      - 0.0032465454214326457
+      - /data/train/fineweb2_ca_shard_3_text_document
+      - 0.0033184730486265257
+      - /data/train/aya_mini_shard_0_part_07_text_document
+      - 0.0035550880053499237
+      - /data/train/fineweb2_es_shard_133_text_document
+      - 0.0030043568646454487
+      - /data/train/finewebedu_mini_shard_14_part_04_text_document
+      - 0.0042180314805270805
+      - /data/train/finewebedu_mini_shard_13_part_03_text_document
+      - 0.0035525159449430054
+      - /data/train/fineweb2_es_shard_128_text_document
+      - 0.005895394386387841
+      - /data/train/starcoder_mini_shard_0_part_02_text_document
+      - 0.003913530813949075
+      - /data/train/fineweb2_fr_shard_14_text_document
+      - 0.004217492987575035
+      - /data/train/finewebedu_mini_shard_2_part_01_text_document
+      - 0.0031948410929679575
+      - /data/train/wikipedia_mini_wikipedia_shuffled_part_00_text_document
+      - 0.0035508924206580483
+      - /data/train/fineweb2_es_shard_121_text_document
+      - 0.0033194544203026997
+      - /data/train/aya_mini_shard_0_part_03_text_document
+      - 0.004217350464205741
+      - /data/train/finewebedu_mini_shard_4_part_02_text_document
+      - 0.003566212251845438
+      - /data/train/fineweb2_pt_shard_58_text_document
+      - 0.004216435988530031
+      - /data/train/finewebedu_mini_shard_10_part_02_text_document
+      - 0.003560368269957409
+      - /data/train/fineweb2_es_shard_106_text_document
+      - 0.004216730479608629
+      - /data/train/finewebedu_mini_shard_14_part_01_text_document
+      - 0.013546029740128942
+      - /data/train/automathtext_mini_shard_0_part_00_text_document
+      - 0.004867591219286917
+      - /data/train/openwebmath_mini_shard_0_part_00_text_document
+      - 0.02114133175663862
+      - /data/train/arxiv-redpajama-nonmath_en_20250224_train_mini_shard_0_part_00_text_document
+      - 0.004217301272541401
+      - /data/train/finewebedu_mini_shard_13_part_02_text_document
+      - 0.0011155619562420566
+      - /data/train/wikipedia_mini_wikipedia_shuffled_part_11_text_document
+      - 0.0037759489091918922
+      - /data/train/fineweb2_no_shard_1_text_document
+      - 0.0030374303300611653
+      - /data/train/finewebedu_mini_shard_11_part_04_text_document
+      - 0.003034789853098145
+      - /data/train/finewebedu_mini_shard_15_part_04_text_document
+      - 0.0035471826670080146
+      - /data/train/fineweb2_es_shard_119_text_document
+      - 0.0035515321674099132
+      - /data/train/fineweb2_es_shard_126_text_document
+      - 0.002374441358169865
+      - /data/train/fineweb2_uk_shard_25_text_document
+      - 0.0042172138405923145
+      - /data/train/finewebedu_mini_shard_10_part_01_text_document
+      - 0.013515614260029644
+      - /data/train/automathtext_mini_shard_0_part_03_text_document
+      - 0.0030176926005003445
+      - /data/train/finewebedu_mini_shard_2_part_04_text_document
+      - 0.021151705396049842
+      - /data/train/arxiv-redpajama-nonmath_en_20250224_train_mini_shard_0_part_01_text_document
+      - 0.0059100371648355835
+      - /data/train/starcoder_mini_shard_0_part_03_text_document
+      - 0.0028366237050523784
+      - /data/train/finewebedu_mini_shard_9_part_04_text_document
+      - 0.0042173052141595115
+      - /data/train/finewebedu_mini_shard_2_part_02_text_document
+      - 0.003864389069450679
+      - /data/train/fineweb2_ro_shard_16_text_document
+      - 0.003678704861891024
+      - /data/train/fineweb2_it_shard_5_text_document
+      - 0.003320783458577578
+      - /data/train/aya_mini_shard_0_part_02_text_document
+      - 0.004218305366387299
+      - /data/train/finewebedu_mini_shard_6_part_00_text_document
+      - 0.003197670901071276
+      - /data/train/wikipedia_mini_wikipedia_shuffled_part_01_text_document
+      - 0.004217964403749446
+      - /data/train/finewebedu_mini_shard_14_part_02_text_document
+      - 0.0032465454214326457
+      - /data/train/fineweb2_ca_shard_3_text_document_copy1
+      - 0.004217793577771241
+      - /data/train/finewebedu_mini_shard_9_part_03_text_document
+      - 0.0035562927263749927
+      - /data/train/fineweb2_es_shard_116_text_document
+      - 0.003822958713043772
+      - /data/train/fineweb2_sk_shard_1_text_document
+      - 0.004217091609882739
+      - /data/train/finewebedu_mini_shard_15_part_01_text_document
+      - 0.004216353135142917
+      - /data/train/finewebedu_mini_shard_3_part_03_text_document
+      - 0.0028530581525168432
+      - /data/train/fineweb2_eu_shard_1_text_document_copy2
+      - 0.004216945197270028
+      - /data/train/finewebedu_mini_shard_8_part_01_text_document
+      - 0.004217244748419881
+      - /data/train/finewebedu_mini_shard_6_part_01_text_document
+      - 0.002824426439613479
+      - /data/train/fineweb2_eu_shard_0_text_document_copy3
+      - 0.00355257152632003
+      - /data/train/fineweb2_es_shard_130_text_document
+      - 0.0030149965370917806
+      - /data/train/finewebedu_mini_shard_13_part_04_text_document
+      - 0.003050523008476614
+      - /data/train/finewebedu_mini_shard_6_part_04_text_document
+      - 0.004629084833270511
+      - /data/train/openwebmath_mini_shard_0_part_04_text_document
+      - 0.004216892136636347
+      - /data/train/finewebedu_mini_shard_15_part_00_text_document
+      - 0.0042182724210151805
+      - /data/train/finewebedu_mini_shard_1_part_02_text_document
+      - 0.02651642489053069
+      - /data/train/train_mix_dades_annealing_papers_no_privative_licenses_shard_1_text_document
+      - 0.0010960874061402696
+      - /data/train/fineweb2_nn_shard_0_text_document
+      - 0.01323797336063439
+      - /data/train/automathtext_mini_shard_0_part_04_text_document
+      - 0.002824426439613479
+      - /data/train/fineweb2_eu_shard_0_text_document_copy4
+      - 0.004217243271791408
+      - /data/train/finewebedu_mini_shard_9_part_00_text_document
+      - 0.0035460215774821757
+      - /data/train/fineweb2_et_shard_2_text_document
+      - 0.003053364185267573
+      - /data/train/finewebedu_mini_shard_12_part_04_text_document
+      - 0.0035497444771804385
+      - /data/train/fineweb2_es_shard_135_text_document
+      - 0.002824426439613479
+      - /data/train/fineweb2_eu_shard_0_text_document_copy2
+      - 0.004218246095128598
+      - /data/train/finewebedu_mini_shard_13_part_00_text_document
+      - 0.003535563594539317
+      - /data/train/fineweb2_es_shard_0_text_document
+      - 0.004872864132852653
+      - /data/train/openwebmath_mini_shard_0_part_02_text_document
+      - 0.003552501411810135
+      - /data/train/fineweb2_es_shard_118_text_document
+      - 0.005685448451590153
+      - /data/train/mathpile_mini_shard_0_part_00_text_document
+      - 0.00421651791775722
+      - /data/train/finewebedu_mini_shard_9_part_02_text_document
+      - 0.004217217461204235
+      - /data/train/finewebedu_mini_shard_12_part_03_text_document
+      - 0.0035509437968539856
+      - /data/train/fineweb2_es_shard_103_text_document
+      - 0.004216656820514595
+      - /data/train/finewebedu_mini_shard_14_part_03_text_document
+      - 0.004217103166105574
+      - /data/train/finewebedu_mini_shard_7_part_00_text_document
+      - 0.004217537097204537
+      - /data/train/finewebedu_mini_shard_7_part_02_text_document
+      - 0.0035552634639543007
+      - /data/train/fineweb2_es_shard_113_text_document
+      - 0.0035558556933425315
+      - /data/train/fineweb2_es_shard_107_text_document
+      - 0.0030179922699156364
+      - /data/train/finewebedu_mini_shard_8_part_04_text_document
+      - 0.004216185042785845
+      - /data/train/finewebedu_mini_shard_0_part_02_text_document
+      - 0.003320052762324589
+      - /data/train/aya_mini_shard_0_part_05_text_document
+      - 0.0037464134861467232
+      - /data/train/fineweb2_sl_shard_3_text_document
+      - 0.0032030218140726347
+      - /data/train/wikipedia_mini_wikipedia_shuffled_part_03_text_document
+      - 0.004215975934285237
+      - /data/train/finewebedu_mini_shard_8_part_03_text_document
+      - 0.004217573299944731
+      - /data/train/finewebedu_mini_shard_8_part_02_text_document
+      - 0.026528396559577366
+      - /data/train/train_mix_dades_annealing_papers_no_privative_licenses_shard_4_text_document
+      - 0.003547375527526895
+      - /data/train/fineweb2_es_shard_110_text_document
+      - 0.0008781329312001317
+      - /data/train/fineweb2_ga_shard_0_text_document
+      - 0.004023229739224742
+      - /data/train/fineweb2_hu_shard_11_text_document
+      - 0.026503366264113964
+      - /data/train/train_mix_dades_annealing_papers_no_privative_licenses_shard_0_text_document
+      - 0.00372270012702484
+      - /data/train/fineweb2_pl_shard_25_text_document
+      - 0.003193207166392942
+      - /data/train/wikipedia_mini_wikipedia_shuffled_part_05_text_document
+      - 0.003549205737560479
+      - /data/train/fineweb2_es_shard_129_text_document
+      - 0.002824426439613479
+      - /data/train/fineweb2_eu_shard_0_text_document
+      - 0.0030075722890371406
+      - /data/train/finewebedu_mini_shard_7_part_04_text_document
+      - 0.004216673730782776
+      - /data/train/finewebedu_mini_shard_0_part_01_text_document
+      - 0.0035473524708349306
+      - /data/train/fineweb2_es_shard_117_text_document
+      - 0.0031966048023455416
+      - /data/train/wikipedia_mini_wikipedia_shuffled_part_02_text_document
+      - 0.004217566040136321
+      - /data/train/finewebedu_mini_shard_6_part_02_text_document
+      - 0.004217593215844554
+      - /data/train/finewebedu_mini_shard_12_part_00_text_document
+      - 0.0048651490464319555
+      - /data/train/openwebmath_mini_shard_0_part_01_text_document
+      - 0.003601384394908374
+      - /data/train/fineweb2_nl_shard_35_text_document
+      - 0.003551567907225391
+      - /data/train/fineweb2_es_shard_125_text_document
+      - 0.0042187356549107605
+      - /data/train/finewebedu_mini_shard_3_part_01_text_document
+      - 0.0035491997279867033
+      - /data/train/fineweb2_es_shard_100_text_document
+      - 0.0035538750091231816
+      - /data/train/fineweb2_es_shard_120_text_document
+      - 0.003684094843035198
+      - /data/train/fineweb2_fi_shard_14_text_document
+      - 0.004217606302760064
+      - /data/train/finewebedu_mini_shard_1_part_01_text_document
+      - 0.003547776837638941
+      - /data/train/fineweb2_es_shard_114_text_document
+      - 0.0028530581525168432
+      - /data/train/fineweb2_eu_shard_1_text_document
+      - 0.004216925740915908
+      - /data/train/finewebedu_mini_shard_12_part_01_text_document
+      - 0.0035482593927281397
+      - /data/train/fineweb2_es_shard_11_text_document
+      - 0.0006153388603714763
+      - /data/train/fineweb2_mt_shard_0_text_document
+      - 0.003552807916967765
+      - /data/train/fineweb2_es_shard_10_text_document
+      - 0.00322671020567097
+      - /data/train/fineweb2_ca_shard_0_text_document
+      - 0.004218353456493557
+      - /data/train/finewebedu_mini_shard_13_part_01_text_document
+      - 0.004217421523149636
+      - /data/train/finewebedu_mini_shard_1_part_03_text_document
+      - 0.003552576795890063
+      - /data/train/fineweb2_es_shard_112_text_document
+      - 0.0035424751517815537
+      - /data/train/fineweb2_sv_shard_11_text_document
+      - 0.003320686506260703
+      - /data/train/aya_mini_shard_0_part_01_text_document
+      - 0.004217500877569282
+      - /data/train/finewebedu_mini_shard_14_part_00_text_document
+      - 0.0009973505263113826
+      - /data/train/fineweb2_cy_shard_0_text_document
+      - 0.004217379054030715
+      - /data/train/finewebedu_mini_shard_4_part_00_text_document
+      - 0.003550693450884522
+      - /data/train/fineweb2_es_shard_101_text_document
+      - 0.003201663957889436
+      - /data/train/wikipedia_mini_wikipedia_shuffled_part_09_text_document
+      - 0.0028530581525168432
+      - /data/train/fineweb2_eu_shard_1_text_document_copy4
+      - 4.2433166228046305e-06
+      - /data/train/fineweb2_ar_shard_0_text_document
+      - 0.003681466935998771
+      - /data/train/fineweb2_cs_shard_14_text_document
+      - 0.003243810463900412
+      - /data/train/fineweb2_ca_shard_4_text_document_copy1
+      - 0.026518254365629053
+      - /data/train/train_mix_dades_annealing_papers_no_privative_licenses_shard_2_text_document
+      - 0.003560361522069396
+      - /data/train/fineweb2_es_shard_123_text_document
+      - 0.00333433945536392
+      - /data/train/fineweb2_lt_shard_4_text_document
+      - 0.003554578864190178
+      - /data/train/fineweb2_es_shard_102_text_document
+      - 0.0032014555353283712
+      - /data/train/wikipedia_mini_wikipedia_shuffled_part_07_text_document
+      - 0.01354968285983955
+      - /data/train/automathtext_mini_shard_0_part_02_text_document
+      - 0.00355301583774547
+      - /data/train/fineweb2_es_shard_111_text_document
+      - 0.004217329049713863
+      - /data/train/finewebedu_mini_shard_5_part_03_text_document
+      - 0.00421741197912876
+      - /data/train/finewebedu_mini_shard_5_part_01_text_document
+      - 0.0035499356448140443
+      - /data/train/fineweb2_es_shard_134_text_document
+      - 0.0024577889140397716
+      - /data/train/fineweb2_ru_shard_276_text_document
+      - 0.00258254626502537
+      - /data/train/fineweb2_gl_shard_0_text_document_copy2
+      - 0.0030329897213445534
+      - /data/train/finewebedu_mini_shard_10_part_04_text_document
+      - 0.004217221742413104
+      - /data/train/finewebedu_mini_shard_10_part_00_text_document
+      - 0.00258254626502537
+      - /data/train/fineweb2_gl_shard_0_text_document_copy1
+      - 0.004217120405827478
+      - /data/train/finewebedu_mini_shard_0_part_03_text_document
+      - 0.004217326074493335
+      - /data/train/finewebedu_mini_shard_2_part_00_text_document
+      - 0.00258254626502537
+      - /data/train/fineweb2_gl_shard_0_text_document_copy3
+      - 0.0035469037075604886
+      - /data/train/fineweb2_es_shard_131_text_document
+      - 0.0035497804856274118
+      - /data/train/fineweb2_es_shard_104_text_document
+      - 0.005906952732932944
+      - /data/train/starcoder_mini_shard_0_part_01_text_document
+      - 0.0042180541621486545
+      - /data/train/finewebedu_mini_shard_15_part_02_text_document
+      - 0.003196638879686857
+      - /data/train/wikipedia_mini_wikipedia_shuffled_part_08_text_document
+      - 0.0024932016258994295
+      - /data/train/fineweb2_sr_shard_2_text_document
+      - 0.0035538852424626135
+      - /data/train/fineweb2_es_shard_122_text_document
+      - 0.003544424740638142
+      - /data/train/fineweb2_es_shard_127_text_document
+      - 0.0035596909739288593
+      - /data/train/fineweb2_es_shard_12_text_document
+      validation:
+      - 0.008332568038961576
+      - /data/validation/fineweb2_ar_shard_0_validation_text_document
+      - 0.00746626265115056
+      - /data/validation/fineweb2_nl_shard_0_validation_text_document
+      - 0.007450531333818254
+      - /data/validation/fineweb2_nn_shard_0_validation_text_document
+      - 0.007849239863817057
+      - /data/validation/fineweb2_lt_shard_0_validation_text_document
+      - 0.008146242852835078
+      - /data/validation/fineweb2_sk_shard_0_validation_text_document
+      - 0.009000783070908425
+      - /data/validation/fineweb2_as_shard_0_validation_text_document
+      - 0.11873196499342967
+      - /data/validation/starcoder_mini_shard_0_part_04_validation_text_document
+      - 0.007479777120653621
+      - /data/validation/fineweb2_sv_shard_0_validation_text_document
+      - 0.007382805321752373
+      - /data/validation/fineweb2_lv_shard_0_validation_text_document
+      - 0.007042075664743688
+      - /data/validation/fineweb2_gl_shard_0_validation_text_document
+      - 0.007308264177627988
+      - /data/validation/fineweb2_eu_shard_0_validation_text_document
+      - 0.11631146502551024
+      - /data/validation/automathtext_mini_shard_0_part_04_validation_text_document
+      - 0.005596010677751986
+      - /data/validation/fineweb2_sr_shard_0_validation_text_document
+      - 0.008070798656375522
+      - /data/validation/fineweb2_et_shard_0_validation_text_document
+      - 0.05644421201463343
+      - /data/validation/validation_data_annealing_papers
+      - 0.007447859318481361
+      - /data/validation/fineweb2_pl_shard_0_validation_text_document
+      - 0.004706732075494991
+      - /data/validation/fineweb2_uk_shard_0_validation_text_document
+      - 0.007855034692390418
+      - /data/validation/fineweb2_ga_shard_0_validation_text_document
+      - 0.0076943663883349885
+      - /data/validation/fineweb2_cs_shard_0_validation_text_document
+      - 0.007119102387593833
+      - /data/validation/fineweb2_hr_shard_0_validation_text_document
+      - 0.06689131350980182
+      - /data/validation/aya_mini_shard_0_part_09_validation_text_document
+      - 0.008171269054807551
+      - /data/validation/fineweb2_ro_shard_0_validation_text_document
+      - 0.10232788095410052
+      - /data/validation/openwebmath_mini_shard_0_part_04_validation_text_document
+      - 0.007572224190394847
+      - /data/validation/fineweb2_de_shard_0_validation_text_document
+      - 0.00842699818250012
+      - /data/validation/fineweb2_cy_shard_0_validation_text_document
+      - 0.008038695145860144
+      - /data/validation/fineweb2_no_shard_0_validation_text_document
+      - 0.08435671563218644
+      - /data/validation/finewebedu_mini_shard_9_part_04_validation_text_document
+      - 0.00512895346653684
+      - /data/validation/fineweb2_bg_shard_0_validation_text_document
+      - 0.007830655192412812
+      - /data/validation/fineweb2_fr_shard_0_validation_text_document
+      - 0.007516615101516544
+      - /data/validation/fineweb2_it_shard_0_validation_text_document
+      - 0.004784744873233705
+      - /data/validation/fineweb2_ru_shard_0_validation_text_document
+      - 0.0073533774679139475
+      - /data/validation/fineweb2_es_shard_0_validation_text_document
+      - 0.008031406639593687
+      - /data/validation/fineweb2_oc_shard_0_validation_text_document
+      - 0.007500118374503379
+      - /data/validation/fineweb2_ca_shard_0_validation_text_document
+      - 0.008542477456396316
+      - /data/validation/fineweb2_mt_shard_0_validation_text_document
+      - 0.005006458786878776
+      - /data/validation/fineweb2_el_shard_0_validation_text_document
+      - 0.007903962650524468
+      - /data/validation/fineweb2_sl_shard_0_validation_text_document
+      - 0.007235936239992788
+      - /data/validation/fineweb2_pt_shard_0_validation_text_document
+      - 0.13192797236222312
+      - /data/validation/mathpile_mini_shard_0_part_02_validation_text_document
+      - 0.007783156824386779
+      - /data/validation/fineweb2_fi_shard_0_validation_text_document
+      - 0.007883467003856115
+      - /data/validation/fineweb2_da_shard_0_validation_text_document
+      - 0.00837685547332166
+      - /data/validation/fineweb2_hu_shard_0_validation_text_document
+      - 0.0639726490907926
+      - /data/validation/wikipedia_mini_wikipedia_shuffled_part_11_validation_text_document
